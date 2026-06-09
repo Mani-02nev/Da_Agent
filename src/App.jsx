@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Chart as ChartJS, CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend,
   ArcElement, PointElement, LineElement, Filler, RadialLinearScale, RadarController
@@ -11,9 +11,20 @@ import {
   TrendingUp, Activity, BarChart2, AlertTriangle, CheckCircle2, Clock, Zap, FileText,
   Plus, ChevronLeft, ChevronRight, X, Download, Play, Loader2, Bot, User, Send,
   Globe, Sparkles, Star, Info, Target, RotateCcw, FolderOpen, Filter, Package,
-  Eye, ChevronDown, Cpu, Layers, Hash, Type, Calendar
+  Eye, ChevronDown, Cpu, Layers, Hash, Type, Calendar, LogOut, LogIn, Shield, Lock,
+  UserCircle2, BarChart3, Award, TrendingUp as TrendUp, Cloud, Trash2
 } from 'lucide-react';
+import { createClient } from '@supabase/supabase-js';
 import './index.css';
+
+// ============================================================
+// Supabase Client
+// ============================================================
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const SUPABASE_READY = SUPABASE_URL && !SUPABASE_URL.includes('YOUR_PROJECT_REF') && SUPABASE_ANON_KEY && !SUPABASE_ANON_KEY.includes('YOUR_SUPABASE');
+const supabase = SUPABASE_READY ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
 
 // ============================================================
 // ChartJS Registration
@@ -565,6 +576,49 @@ const fillMissingValues = (rows, schema, opts = { useMean: false }) => rows.map(
   return cleaned;
 });
 
+// Imputation helpers and UI actions
+const imputeColumn = (rows, col, strategy, constant) => {
+  if (!rows.length) return rows;
+  const vals = rows.map(r => r[col]).filter(v => v !== '' && v !== null && v !== undefined && !isNaN(Number(v))).map(Number);
+  const numeric = vals.length > 0;
+  const min = numeric ? Math.min(...vals) : undefined;
+  const max = numeric ? Math.max(...vals) : undefined;
+  const mean = numeric ? (vals.reduce((s,v)=>s+v,0)/vals.length) : undefined;
+  const sorted = numeric ? [...vals].sort((a,b)=>a-b) : [];
+  const median = numeric && sorted.length ? sorted[Math.floor(sorted.length/2)] : undefined;
+  const mode = (() => { const freq = {}; rows.forEach(r=>{ const v = r[col]; if (v!=='' && v!==null && v!==undefined) { const k=String(v); freq[k]=(freq[k]||0)+1; }}); const ent = Object.entries(freq).sort((a,b)=>b[1]-a[1]); return ent[0]?.[0]; })();
+  return rows.map(r=>{
+    if (r[col]!=='' && r[col]!==null && r[col]!==undefined) return r;
+    const out = { ...r };
+    if (strategy === 'median' && median !== undefined) out[col] = median;
+    else if (strategy === 'mean' && mean !== undefined) out[col] = parseFloat(mean.toFixed(2));
+    else if (strategy === 'min' && min !== undefined) out[col] = min;
+    else if (strategy === 'max' && max !== undefined) out[col] = max;
+    else if (strategy === 'mode' && mode !== undefined) out[col] = mode;
+    else if (strategy === 'constant') out[col] = (constant !== undefined ? constant : (numeric ? 0 : 'Unknown'));
+    else out[col] = (numeric ? (median ?? mean ?? 0) : (mode || 'Unknown'));
+    return out;
+  });
+};
+
+const handleApplyImpute = (col) => {
+  const strat = imputeStrategy[col] || 'median';
+  const constVal = imputeConstant[col];
+  const updated = imputeColumn(dataRows, col, strat, constVal);
+  setDataRows(updated);
+  setCleanedRows(updated);
+};
+
+const handleApplyImputeAll = () => {
+  let updated = [...dataRows];
+  Object.keys(schema).forEach(col => {
+    const strat = imputeStrategy[col];
+    if (strat) updated = imputeColumn(updated, col, strat, imputeConstant[col]);
+  });
+  setDataRows(updated);
+  setCleanedRows(updated);
+};
+
 const engineerFeatures = (rows, headers, schema) => {
   const newFeatures = [];
   const enhanced = rows.map(r => ({ ...r }));
@@ -628,7 +682,9 @@ ${headers.map(h => `• ${h}: ${schema[h]?.type || '?'} (unique=${schema[h]?.uni
 SAMPLE (3 rows):
 ${JSON.stringify(rows.slice(0, 3), null, 2)}
 
-CHART GENERATION — When user asks for a chart/visual, include EXACTLY this JSON block:
+CHART GENERATION — When user asks for a chart/visual, choose the BEST type and include EXACTLY this JSON block:
+
+For standard charts (bar, line, pie, doughnut, scatter):
 \`\`\`json
 {
   "chart_type": "bar" | "line" | "pie" | "doughnut" | "scatter",
@@ -639,6 +695,20 @@ CHART GENERATION — When user asks for a chart/visual, include EXACTLY this JSO
   "y_label": "Y axis label"
 }
 \`\`\`
+
+For BOX PLOTS — use when asked about distributions, spread, quartiles, outliers, or box plots:
+\`\`\`json
+{
+  "chart_type": "boxplot",
+  "title": "Distribution of [Column] by [Category]",
+  "labels": ["Group A", "Group B", "Group C"],
+  "data": [
+    {"min": 10.0, "q1": 25.0, "median": 40.0, "q3": 60.0, "max": 80.0},
+    {"min": 5.0, "q1": 20.0, "median": 35.0, "q3": 55.0, "max": 75.0}
+  ]
+}
+\`\`\`
+IMPORTANT: For box plots, calculate ACTUAL statistics from the sample data provided in context. Do NOT use placeholder values.
 
 RESPONSE GUIDELINES:
 - Explain how this data relates to AI/ML (classification, regression, clustering, time-series, etc.)
@@ -652,6 +722,87 @@ RESPONSE GUIDELINES:
 // Hoisted Display Components
 // ============================================================
 
+// Premium SVG Box Plot Component for AI Chat
+const BoxPlotChart = ({ config }) => {
+  const [tooltip, setTooltip] = useState(null);
+  const labels = config.labels || [];
+  const items = Array.isArray(config.data) ? config.data : [];
+  if (!items.length) return null;
+
+  const allVals = items.flatMap(d => [d.min, d.max].filter(v => v != null));
+  const globalMin = Math.min(...allVals);
+  const globalMax = Math.max(...allVals);
+  const range = globalMax - globalMin || 1;
+  const toX = v => ((v - globalMin) / range) * 100;
+
+  const GRAD_COLORS = ['#1F5EDC', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444', '#06b6d4', '#f43f5e', '#84cc16'];
+
+  return (
+    <div className="my-3 bg-white border border-slate-100 rounded-2xl p-4 shadow-sm relative" style={{overflow:'visible'}}>
+      {config.title && <p className="text-[10px] font-black uppercase text-slate-500 mb-3 tracking-wider">{config.title}</p>}
+      <div className="space-y-4">
+        {items.map((d, i) => {
+          const color = GRAD_COLORS[i % GRAD_COLORS.length];
+          const minX = toX(d.min ?? globalMin);
+          const q1X = toX(d.q1 ?? d.min ?? globalMin);
+          const medX = toX(d.median ?? ((d.q1 + d.q3) / 2));
+          const q3X = toX(d.q3 ?? d.max ?? globalMax);
+          const maxX = toX(d.max ?? globalMax);
+          return (
+            <div key={i} className="flex items-center gap-3">
+              <div className="w-24 text-[10px] font-bold text-slate-600 text-right truncate flex-shrink-0">
+                {labels[i] || `Group ${i + 1}`}
+              </div>
+              <div className="flex-1 relative h-8 cursor-crosshair"
+                onMouseMove={e => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setTooltip({ i, xPx: e.clientX - rect.left, yPx: e.clientY - rect.top, ...d, label: labels[i] || `Group ${i+1}` });
+                }}
+                onMouseLeave={() => setTooltip(null)}
+              >
+                <svg width="100%" height="32" viewBox="0 0 100 32" preserveAspectRatio="none" className="overflow-visible">
+                  {/* Whisker connecting line */}
+                  <line x1={`${minX}%`} y1="16" x2={`${maxX}%`} y2="16" stroke={color} strokeWidth="1.5" strokeOpacity="0.35" />
+                  {/* Min whisker cap */}
+                  <line x1={`${minX}%`} y1="10" x2={`${minX}%`} y2="22" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
+                  {/* Max whisker cap */}
+                  <line x1={`${maxX}%`} y1="10" x2={`${maxX}%`} y2="22" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
+                  {/* IQR box */}
+                  <rect x={`${q1X}%`} y="7" width={`${Math.max(q3X - q1X, 0.5)}%`} height="18" rx="3" fill={color} fillOpacity="0.18" stroke={color} strokeWidth="1.5" />
+                  {/* Median line */}
+                  <line x1={`${medX}%`} y1="6" x2={`${medX}%`} y2="26" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
+                  {/* Median dot */}
+                  <circle cx={`${medX}%`} cy="16" r="4" fill={color} />
+                </svg>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {/* X-axis scale labels */}
+      <div className="flex justify-between mt-2 pl-28 text-[9px] text-slate-400">
+        <span>{globalMin.toFixed(1)}</span>
+        <span>{((globalMin + globalMax) / 2).toFixed(1)}</span>
+        <span>{globalMax.toFixed(1)}</span>
+      </div>
+      {/* Hover Tooltip */}
+      {tooltip && (
+        <div
+          className="fixed z-[9999] bg-slate-900 text-white text-[10px] rounded-xl px-3 py-2.5 shadow-2xl pointer-events-none border border-slate-700"
+          style={{ left: tooltip.xPx + 160, top: tooltip.yPx + 80, minWidth: 140, transform: 'translateY(-50%)' }}
+        >
+          <p className="font-black mb-1.5 text-blue-300 border-b border-slate-700 pb-1">{tooltip.label}</p>
+          <p className="flex justify-between gap-3">Max <span className="font-bold text-emerald-300">{tooltip.max?.toFixed(2)}</span></p>
+          <p className="flex justify-between gap-3">Q3 <span className="font-bold text-white">{tooltip.q3?.toFixed(2)}</span></p>
+          <p className="flex justify-between gap-3">Median <span className="font-bold text-yellow-300">{tooltip.median?.toFixed(2)}</span></p>
+          <p className="flex justify-between gap-3">Q1 <span className="font-bold text-white">{tooltip.q1?.toFixed(2)}</span></p>
+          <p className="flex justify-between gap-3">Min <span className="font-bold text-red-300">{tooltip.min?.toFixed(2)}</span></p>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // Chat Message — supports markdown + embedded charts
 const ChatMessage = ({ msg }) => {
   if (msg.role === 'user') return <span>{msg.text}</span>;
@@ -660,6 +811,7 @@ const ChatMessage = ({ msg }) => {
   return (
     <>
       {parts.map((part, i) => {
+
         if (i % 2 === 1) {
           try {
             const cfg = JSON.parse(part);
@@ -675,7 +827,7 @@ const ChatMessage = ({ msg }) => {
 
 // Small chart embedded in chat
 const ChatChart = ({ config }) => {
-  const isPolar = ['pie', 'doughnut'].includes(config.chart_type);
+  if (config.chart_type === 'boxplot') return <BoxPlotChart config={config} />;
   const opts = getChartOpts(config.chart_type);
   const data = {
     labels: config.labels || [],
@@ -918,6 +1070,18 @@ const App = () => {
   const [imputeConstant, setImputeConstant] = useState({});
   const [pipelineMode, setPipelineMode] = useState('auto'); // 'auto' | 'manual'
 
+  // ---- Supabase Auth States ----
+  const [supaUser, setSupaUser] = useState(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authTab, setAuthTab] = useState('signin');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authName, setAuthName] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [authSuccess, setAuthSuccess] = useState('');
+  const [dbSyncing, setDbSyncing] = useState(false);
+
   // Translation helper
   const T = (k) => LANG[lang]?.[k] || LANG.en[k] || k;
 
@@ -966,6 +1130,93 @@ const App = () => {
   useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
   useEffect(() => { if (isMiniOpen) miniMsgEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, isMiniOpen]);
 
+  // ---- Supabase Auth Init ----
+  useEffect(() => {
+    if (!supabase) return;
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSupaUser(session?.user ?? null);
+      if (session?.user) loadProjectsFromDB(session.user.id);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSupaUser(session?.user ?? null);
+      if (session?.user) loadProjectsFromDB(session.user.id);
+      else setProjects([]);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // ---- Supabase DB Helpers ----
+  const loadProjectsFromDB = async (userId) => {
+    if (!supabase) return;
+    setDbSyncing(true);
+    try {
+      const { data, error } = await supabase
+        .from('projects')
+        .select('id, name, type, file_name, row_count, col_count, created_at')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(10);
+      if (error) throw error;
+      setProjects((data || []).map(p => ({
+        id: p.id, name: p.name, type: p.type, fileName: p.file_name,
+        rowCount: p.row_count, colCount: p.col_count, timestamp: p.created_at
+      })));
+    } catch (err) {
+      console.warn('Supabase load error:', err.message);
+    } finally { setDbSyncing(false); }
+  };
+
+  const saveProjectToDB = async (proj, rows, msgs) => {
+    if (!supabase || !supaUser) return;
+    try {
+      await supabase.from('projects').upsert({
+        id: proj.id, user_id: supaUser.id, name: proj.name, type: proj.type,
+        file_name: proj.fileName, row_count: proj.rowCount, col_count: proj.colCount,
+        data_rows: rows, messages: msgs || []
+      }, { onConflict: 'id' });
+    } catch (err) { console.warn('Supabase save error:', err.message); }
+  };
+
+  const syncMessagesToDB = useCallback(async (msgs) => {
+    if (!supabase || !supaUser || !activeProjectId) return;
+    try { await supabase.from('projects').update({ messages: msgs }).eq('id', activeProjectId).eq('user_id', supaUser.id); }
+    catch { /* silent */ }
+  }, [supaUser, activeProjectId]);
+
+  const syncCleanedRowsToDB = useCallback(async (rows) => {
+    if (!supabase || !supaUser || !activeProjectId) return;
+    try { await supabase.from('projects').update({ cleaned_rows: rows }).eq('id', activeProjectId).eq('user_id', supaUser.id); }
+    catch { /* silent */ }
+  }, [supaUser, activeProjectId]);
+
+  // ---- Supabase Auth Actions ----
+  const handleAuthSignIn = async (e) => {
+    e.preventDefault();
+    if (!supabase) { setAuthError('Supabase not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env'); return; }
+    setAuthLoading(true); setAuthError(''); setAuthSuccess('');
+    const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
+    setAuthLoading(false);
+    if (error) setAuthError(error.message);
+    else { setAuthModalOpen(false); setAuthEmail(''); setAuthPassword(''); }
+  };
+
+  const handleAuthSignUp = async (e) => {
+    e.preventDefault();
+    if (!supabase) { setAuthError('Supabase not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env'); return; }
+    setAuthLoading(true); setAuthError(''); setAuthSuccess('');
+    const { error } = await supabase.auth.signUp({ email: authEmail, password: authPassword, options: { data: { full_name: authName } } });
+    setAuthLoading(false);
+    if (error) setAuthError(error.message);
+    else setAuthSuccess('Account created! Check your email to confirm, then sign in.');
+  };
+
+  const handleSignOut = async () => {
+    if (!supabase) return;
+    await supabase.auth.signOut();
+    setSupaUser(null); setProjects([]); setDataRows([]); setCleanedRows([]);
+    setActiveProjectId(null); setFileName(''); setCurrentPage('home');
+  };
+
   // ---- File Upload ----
   const handleFileSelect = (e) => {
     const file = e.target.files[0];
@@ -981,7 +1232,7 @@ const App = () => {
     e.target.value = '';
   };
 
-  const handleProjectCreate = (projName, projType) => {
+  const handleProjectCreate = async (projName, projType) => {
     if (!pendingFile) return;
     setLoading(true);
     setIsProjModalOpen(false);
@@ -998,6 +1249,7 @@ const App = () => {
     setLoading(false);
     setCurrentPage('dashboard');
     setMessages(prev => [...prev, { role: 'bot', text: `📊 **Project "${projName}" loaded!**\n\n- File: ${pendingFile.file.name}\n- Type: ${projType}\n- Rows: ${rows.length.toLocaleString()}\n- Columns: ${rows.length ? Object.keys(rows[0]).length : 0}\n\nI've auto-generated **${Math.min(autoVisuals.length || 12, 12)} visualizations** for your data. Ask me anything!` }]);
+    if (supaUser) await saveProjectToDB(newProj, rows, []);
   };
 
   // ---- DA Pipeline ----
@@ -1386,7 +1638,58 @@ const App = () => {
               </div>
             </div>
 
-            {/* Pipeline Steps */}
+                {/* Missing Values Controls */}
+                <div className="glass-card p-4 mb-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <p className="text-xs font-black text-slate-500 uppercase tracking-widest">Missing Values — Impute</p>
+                    <div className="text-xs text-slate-400">Choose strategy per column</div>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-100">
+                          <th className="px-3 py-2 text-left font-black text-slate-500">Column</th>
+                          <th className="px-3 py-2 text-left font-black text-slate-500">Type</th>
+                          <th className="px-3 py-2 text-left font-black text-slate-500">Missing</th>
+                          <th className="px-3 py-2 text-left font-black text-slate-500">Strategy</th>
+                          <th className="px-3 py-2 text-left font-black text-slate-500">Constant</th>
+                          <th className="px-3 py-2 text-left font-black text-slate-500">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {headers.map(h=> (
+                          <tr key={h} className="border-b border-slate-50">
+                            <td className="px-3 py-2 text-slate-700 font-semibold">{h}</td>
+                            <td className="px-3 py-2 text-slate-500">{schema[h]?.type}</td>
+                            <td className="px-3 py-2 text-red-500 font-bold">{schema[h]?.missingCount||0}</td>
+                            <td className="px-3 py-2">
+                              <select className="glass-input text-xs" value={imputeStrategy[h]||''} onChange={e=>setImputeStrategy(s=>({...s,[h]:e.target.value}))}>
+                                <option value="">auto</option>
+                                <option value="median">Median</option>
+                                <option value="mean">Mean</option>
+                                <option value="min">Min</option>
+                                <option value="max">Max</option>
+                                <option value="mode">Mode</option>
+                                <option value="constant">Constant</option>
+                              </select>
+                            </td>
+                            <td className="px-3 py-2">
+                              <input className="glass-input text-xs" placeholder="value" value={imputeConstant[h]||''} onChange={e=>setImputeConstant(s=>({...s,[h]:e.target.value}))} />
+                            </td>
+                            <td className="px-3 py-2">
+                              <button onClick={()=>handleApplyImpute(h)} className="btn-ghost px-3 py-1 text-xs">Apply</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="mt-3 flex items-center justify-end gap-2">
+                    <button onClick={handleApplyImputeAll} className="btn-primary px-4 py-2 text-xs">Apply To All</button>
+                  </div>
+                </div>
+
+                {/* Pipeline Steps */}
             <div className="space-y-3 mb-6">
               {['step1', 'step2', 'step3', 'step4', 'step5'].map(k => (
                 <StepCard key={k} stepKey={k} statusMap={pipeStatus} stepDefs={stepDefs} T={T} manualMode={pipelineMode === 'manual'} onRun={runStep} />
@@ -1455,6 +1758,28 @@ const App = () => {
                     )}
                   </div>
                 </div>
+
+                {/* Top 3 performers (e.g., students) */}
+                {dataProfile?.numCols && dataProfile.numCols.length > 0 && (
+                  <div className="glass-card p-5">
+                    <p className="text-xs font-black text-slate-500 uppercase tracking-widest mb-3">Top 3 — {dataProfile.numCols[0]}</p>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      {(() => {
+                        const primary = dataProfile.numCols[0];
+                        const labelCol = dataProfile.catCols && dataProfile.catCols[0] ? dataProfile.catCols[0] : headers[0];
+                        const sorted = [...(cleanedRows.length ? cleanedRows : dataRows)].sort((a, b) => (Number(b[primary]) || 0) - (Number(a[primary]) || 0));
+                        const top = sorted.slice(0, 3);
+                        return top.map((r, i) => (
+                          <div key={i} className="p-3 bg-white rounded-lg shadow-sm">
+                            <p className="text-xs text-slate-400">#{i + 1}</p>
+                            <p className="font-bold text-lg text-slate-800 mt-1">{String(r[labelCol] || r[primary] || 'Record').slice(0, 24)}</p>
+                            <p className="text-sm text-slate-600 mt-1">{primary}: <span className="font-black">{r[primary]}</span></p>
+                          </div>
+                        ));
+                      })()}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1673,12 +1998,193 @@ const App = () => {
   // ============================================================
   // Main Layout
   // ============================================================
+  // ---- Profile Page ----
+  const renderProfile = () => {
+    const joinDate = supaUser?.created_at ? new Date(supaUser.created_at).toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' }) : 'Unknown';
+    const email = supaUser?.email || '';
+    const initials = email ? email.slice(0,2).toUpperCase() : 'VO';
+    const userName = supaUser?.user_metadata?.full_name || email.split('@')[0] || 'User';
+    const totalRows = projects.reduce((s, p) => s + (p.rowCount || 0), 0);
+    const [showDeleteConfirm, setShowDeleteConfirm] = React.useState(false);
+
+    return (
+      <div className="p-8 max-w-2xl mx-auto overflow-y-auto h-full custom-scrollbar">
+        {/* Header */}
+        <div className="mb-8 anim-fade">
+          <h2 className="text-2xl font-black gradient-text mb-1">Profile</h2>
+          <p className="text-sm text-slate-500">Manage your account and preferences</p>
+        </div>
+
+        {/* Auth gate — not signed in */}
+        {!supaUser ? (
+          <div className="glass-card p-10 text-center anim-scale">
+            <div className="w-16 h-16 rounded-2xl bg-blue-100 flex items-center justify-center mx-auto mb-5">
+              <UserCircle2 size={28} className="text-blue-600" />
+            </div>
+            <h3 className="text-lg font-black text-slate-800 mb-2">Sign in to view your profile</h3>
+            <p className="text-sm text-slate-500 mb-6 max-w-xs mx-auto">Create an account or sign in to access cloud sync, project history, and your profile dashboard.</p>
+            <button onClick={() => { setAuthModalOpen(true); setAuthTab('signin'); setAuthError(''); setAuthSuccess(''); }}
+              className="btn-primary px-8 py-3 flex items-center gap-2 mx-auto">
+              <LogIn size={15} /> Sign In to View Once
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-5">
+
+            {/* Profile Card */}
+            <div className="glass-card p-6 anim-fade">
+              <div className="flex items-center gap-5">
+                {/* Avatar */}
+                <div className="w-20 h-20 rounded-2xl flex items-center justify-center flex-shrink-0 text-white text-2xl font-black shadow-lg"
+                  style={{background:'linear-gradient(135deg,#0A2A66,#1F5EDC)'}}>
+                  {initials}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <h3 className="text-xl font-black text-slate-800 truncate">{userName}</h3>
+                    <span className="px-2 py-0.5 bg-emerald-100 text-emerald-700 text-[10px] font-black rounded-full uppercase tracking-wider flex-shrink-0">Pro</span>
+                  </div>
+                  <p className="text-sm text-slate-500 truncate mb-3">{email}</p>
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                      <div className="w-2 h-2 rounded-full bg-emerald-400" />
+                      Cloud Sync Active
+                    </div>
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                      <Shield size={10} className="text-blue-400" />
+                      Row-Level Security
+                    </div>
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                      <Calendar size={10} className="text-slate-400" />
+                      Joined {joinDate}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Stats Row */}
+            <div className="grid grid-cols-3 gap-4">
+              {[
+                { icon: FolderOpen, label: 'Projects', value: projects.length, color: 'text-blue-600', bg: 'bg-blue-50' },
+                { icon: Database, label: 'Rows Analyzed', value: totalRows.toLocaleString(), color: 'text-emerald-600', bg: 'bg-emerald-50' },
+                { icon: MessageSquare, label: 'AI Sessions', value: messages.filter(m => m.role === 'user').length, color: 'text-purple-600', bg: 'bg-purple-50' },
+              ].map(({ icon: Icon, label, value, color, bg }) => (
+                <div key={label} className="glass-card p-5 text-center anim-fade">
+                  <div className={`w-10 h-10 ${bg} rounded-xl flex items-center justify-center mx-auto mb-3`}>
+                    <Icon size={18} className={color} />
+                  </div>
+                  <p className="text-2xl font-black text-slate-800">{value}</p>
+                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mt-1">{label}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* Account details */}
+            <div className="glass-card p-6">
+              <p className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Account Information</p>
+              <div className="space-y-3">
+                {[
+                  { label: 'Email', value: email, icon: User },
+                  { label: 'User ID', value: supaUser.id?.slice(0, 18) + '...', icon: Shield },
+                  { label: 'Member Since', value: joinDate, icon: Calendar },
+                  { label: 'Plan', value: 'Free Tier (Cloud Sync Enabled)', icon: Cloud },
+                ].map(({ label, value, icon: Icon }) => (
+                  <div key={label} className="flex items-center justify-between py-2.5 border-b border-slate-50 last:border-0">
+                    <div className="flex items-center gap-2.5">
+                      <Icon size={13} className="text-slate-400" />
+                      <span className="text-xs font-bold text-slate-500">{label}</span>
+                    </div>
+                    <span className="text-xs text-slate-700 font-semibold truncate max-w-[180px]">{value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Preferences */}
+            <div className="glass-card p-6">
+              <p className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Preferences</p>
+              <div className="space-y-3">
+                {/* Language */}
+                <div>
+                  <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2">Language</p>
+                  <div className="flex gap-2">
+                    <button onClick={() => setLang('en')} className={`flex-1 py-2.5 rounded-xl text-xs font-bold border transition-all ${lang === 'en' ? 'bg-blue-600 text-white border-blue-600 shadow-md' : 'bg-white text-slate-600 border-slate-200 hover:border-blue-200'}`}>🇬🇧 English</button>
+                    <button onClick={() => setLang('ta')} className={`flex-1 py-2.5 rounded-xl text-xs font-bold border transition-all ${lang === 'ta' ? 'bg-blue-600 text-white border-blue-600 shadow-md' : 'bg-white text-slate-600 border-slate-200 hover:border-blue-200'}`}>🇮🇳 தமிழ்</button>
+                  </div>
+                </div>
+                {/* Mode */}
+                <div>
+                  <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2">Application Mode</p>
+                  <div className="flex gap-2">
+                    <button onClick={() => setAppMode('business')} className={`flex-1 py-2.5 rounded-xl text-xs font-bold border transition-all ${appMode === 'business' ? 'bg-emerald-600 text-white border-emerald-600 shadow-md' : 'bg-white text-slate-600 border-slate-200 hover:border-emerald-200'}`}>🏢 Business</button>
+                    <button onClick={() => setAppMode('developer')} className={`flex-1 py-2.5 rounded-xl text-xs font-bold border transition-all ${appMode === 'developer' ? 'bg-purple-600 text-white border-purple-600 shadow-md' : 'bg-white text-slate-600 border-slate-200 hover:border-purple-200'}`}>🔬 DA Developer</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Projects list */}
+            {projects.length > 0 && (
+              <div className="glass-card p-6">
+                <p className="text-xs font-black text-slate-500 uppercase tracking-widest mb-4">Recent Projects ({projects.length})</p>
+                <div className="space-y-2">
+                  {projects.slice(0, 5).map((p, i) => (
+                    <div key={p.id} className="flex items-center gap-3 p-3 bg-slate-50 rounded-xl hover:bg-blue-50/50 transition-colors cursor-pointer"
+                      onClick={() => { setActiveProjectId(p.id); setCurrentPage('dashboard'); }}>
+                      <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center flex-shrink-0">
+                        <Database size={13} className="text-blue-600" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-black text-slate-800 truncate">{p.name}</p>
+                        <p className="text-[10px] text-slate-400">{p.rowCount?.toLocaleString()} rows · {p.type}</p>
+                      </div>
+                      <span className="text-[9px] text-slate-400 flex-shrink-0">{new Date(p.timestamp).toLocaleDateString()}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Danger Zone */}
+            <div className="glass-card p-6 border border-red-100">
+              <p className="text-xs font-black text-red-400 uppercase tracking-widest mb-4">⚠ Danger Zone</p>
+              {!showDeleteConfirm ? (
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <button onClick={handleSignOut}
+                    className="flex-1 py-2.5 rounded-xl text-xs font-bold border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 transition-all flex items-center justify-center gap-2">
+                    <LogOut size={13} /> Sign Out
+                  </button>
+                  <button onClick={() => setShowDeleteConfirm(true)}
+                    className="flex-1 py-2.5 rounded-xl text-xs font-bold border border-red-200 text-red-500 hover:bg-red-50 transition-all flex items-center justify-center gap-2">
+                    <Trash2 size={13} /> Delete Account
+                  </button>
+                </div>
+              ) : (
+                <div className="bg-red-50 rounded-xl p-4">
+                  <p className="text-sm font-bold text-red-700 mb-1">Are you absolutely sure?</p>
+                  <p className="text-xs text-red-500 mb-4">This will permanently delete your account and all projects. This cannot be undone.</p>
+                  <div className="flex gap-2">
+                    <button onClick={() => setShowDeleteConfirm(false)} className="flex-1 py-2 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600">Cancel</button>
+                    <button onClick={handleSignOut} className="flex-1 py-2 rounded-xl text-xs font-bold bg-red-600 text-white">Yes, Delete</button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const NAV_ITEMS = [
     { key: 'home', icon: Home, label: T('home') },
     { key: 'dashboard', icon: LayoutDashboard, label: T('dashboard') },
     { key: 'developer', icon: Code2, label: T('daDev') },
     { key: 'chat', icon: MessageSquare, label: T('aiWorkspace') },
     { key: 'tutorial', icon: BookOpen, label: T('tutorial') },
+    { key: 'profile', icon: UserCircle2, label: 'Profile' },
     { key: 'settings', icon: Settings, label: T('settings') }
   ];
 
@@ -1692,7 +2198,14 @@ const App = () => {
         {/* Brand */}
         <div className="p-5 border-b border-white/5">
           <div className="flex items-center gap-3">
-            <img src="/logo.png" alt="Logo" className="h-8 w-8 object-contain" onError={e => { e.target.style.display = 'none'; }} />
+            <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 overflow-hidden border border-white/20" style={{background:'rgba(255,255,255,0.12)',boxShadow:'0 2px 12px rgba(31,94,220,0.5)'}}>
+              <img
+                src="/logo.png"
+                alt="Logo"
+                className="w-full h-full object-contain"
+                onError={e => { e.target.style.display='none'; e.target.parentElement.innerHTML='<span style="font-size:18px;line-height:1">🔍</span>'; }}
+              />
+            </div>
             <div>
               <p className="font-black text-sm text-white tracking-tight">View Once</p>
               <p className="text-[9px] text-white/40 uppercase tracking-widest font-semibold mt-0.5">Complete Clarity</p>
@@ -1725,12 +2238,40 @@ const App = () => {
           )}
         </nav>
 
-        {/* Bottom mode badge */}
-        <div className="p-4 border-t border-white/5">
+        {/* Bottom: user info + mode badge */}
+        <div className="p-4 border-t border-white/5 space-y-3">
+          {supaUser ? (
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 min-w-0">
+                <div className="w-6 h-6 rounded-lg bg-emerald-500/20 flex items-center justify-center flex-shrink-0">
+                  <User size={10} className="text-emerald-400" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-[10px] text-white/70 font-bold truncate">{supaUser.email?.split('@')[0]}</p>
+                  <p className="text-[9px] text-emerald-400 font-semibold">● Cloud Sync On</p>
+                </div>
+              </div>
+              <button onClick={handleSignOut} title="Sign Out" className="w-6 h-6 rounded-lg bg-white/5 hover:bg-red-500/20 flex items-center justify-center transition-colors flex-shrink-0">
+                <LogOut size={10} className="text-white/40 hover:text-red-400" />
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => { setAuthModalOpen(true); setAuthTab('signin'); setAuthError(''); setAuthSuccess(''); }}
+              className="w-full flex items-center gap-2 px-3 py-2 rounded-xl border border-blue-500/25 transition-all text-left"
+              style={{background:'rgba(31,94,220,0.18)'}}
+            >
+              <LogIn size={12} className="text-blue-400 flex-shrink-0" />
+              <div>
+                <p className="text-[10px] text-blue-300 font-bold">Sign in to sync</p>
+                <p className="text-[9px] text-white/30">Save projects to cloud</p>
+              </div>
+            </button>
+          )}
           {appMode
             ? <span className={appMode === 'business' ? 'mode-badge-biz' : 'mode-badge-dev'}>{appMode === 'business' ? 'Business Mode' : 'DA Developer'}</span>
             : <span className="text-xs text-white/25 font-semibold">No mode selected</span>}
-          <p className="text-[9px] text-white/25 mt-1">Mr K AI Eco System</p>
+          <p className="text-[9px] text-white/25">Mr K AI Eco System</p>
         </div>
       </aside>
 
@@ -1747,6 +2288,8 @@ const App = () => {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {/* DB Sync indicator */}
+            {dbSyncing && <div className="flex items-center gap-1 text-[10px] text-blue-500"><Loader2 size={10} className="anim-spin" /><span>Syncing…</span></div>}
             {/* Language toggle */}
             <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-full">
               <span onClick={() => setLang('en')} className={`lang-pill ${lang === 'en' ? 'lang-active' : ''}`}>EN</span>
@@ -1757,7 +2300,20 @@ const App = () => {
               <BookOpen size={13} />{T('howToUse')}
             </button>
             {/* Upload */}
-            <button onClick={() => fileInputRef.current?.click()} className="btn-primary flex items-center gap-2 px-4 py-2 text-xs">
+            <button
+              onClick={() => {
+                if (!supaUser) {
+                  setAuthModalOpen(true);
+                  setAuthTab('signin');
+                  setAuthError('');
+                  setAuthSuccess('');
+                } else {
+                  fileInputRef.current?.click();
+                }
+              }}
+              className="btn-primary flex items-center gap-2 px-4 py-2 text-xs relative"
+            >
+              {!supaUser && <Lock size={10} className="text-white/70" />}
               <Upload size={13} />{T('uploadCta')}
             </button>
           </div>
@@ -1779,6 +2335,7 @@ const App = () => {
               {currentPage === 'developer' && renderDeveloper()}
               {currentPage === 'chat' && renderChat()}
               {currentPage === 'tutorial' && renderTutorial()}
+              {currentPage === 'profile' && renderProfile()}
               {currentPage === 'settings' && renderSettings()}
             </>
           )}
@@ -1855,6 +2412,74 @@ const App = () => {
           fileName={pendingFile.file?.name || ''}
           previewRows={pendingRows}
         />
+      )}
+
+      {/* ========== AUTH MODAL ========== */}
+      {authModalOpen && (
+        <div className="modal-overlay anim-fade" onClick={e => e.target === e.currentTarget && setAuthModalOpen(false)}>
+          <div className="glass-panel w-full max-w-md mx-4 anim-scale overflow-hidden">
+            <div className="px-8 pt-8 flex items-start justify-between">
+              <div>
+                <div className="w-12 h-12 rounded-2xl flex items-center justify-center mb-4 shadow-lg" style={{background:'linear-gradient(135deg,#1F5EDC,#7c3aed)'}}>
+                  <Shield size={20} className="text-white" />
+                </div>
+                <h2 className="text-xl font-black text-slate-800">{authTab === 'signin' ? 'Welcome Back' : 'Create Account'}</h2>
+                <p className="text-xs text-slate-400 mt-1">{authTab === 'signin' ? 'Sign in to sync projects to the cloud' : 'Join View Once to save your analytics'}</p>
+              </div>
+              <button onClick={() => setAuthModalOpen(false)} className="w-8 h-8 rounded-xl bg-slate-100 hover:bg-slate-200 flex items-center justify-center transition-colors flex-shrink-0 mt-1"><X size={14} /></button>
+            </div>
+            <div className="px-8 pt-5">
+              <div className="flex bg-slate-100 rounded-xl p-1">
+                <button onClick={() => { setAuthTab('signin'); setAuthError(''); setAuthSuccess(''); }} className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${authTab === 'signin' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>Sign In</button>
+                <button onClick={() => { setAuthTab('signup'); setAuthError(''); setAuthSuccess(''); }} className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all ${authTab === 'signup' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>Create Account</button>
+              </div>
+            </div>
+            <form onSubmit={authTab === 'signin' ? handleAuthSignIn : handleAuthSignUp} className="px-8 py-6 space-y-4">
+              {authTab === 'signup' && (
+                <div>
+                  <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Full Name</label>
+                  <input type="text" value={authName} onChange={e => setAuthName(e.target.value)} placeholder="Your name" className="glass-input w-full" required />
+                </div>
+              )}
+              <div>
+                <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Email</label>
+                <input type="email" value={authEmail} onChange={e => setAuthEmail(e.target.value)} placeholder="you@example.com" className="glass-input w-full" required />
+              </div>
+              <div>
+                <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1.5">Password</label>
+                <input type="password" value={authPassword} onChange={e => setAuthPassword(e.target.value)} placeholder={authTab === 'signup' ? 'Min. 8 characters' : 'Your password'} className="glass-input w-full" required minLength={authTab === 'signup' ? 8 : undefined} />
+              </div>
+              {authError && (
+                <div className="flex items-start gap-2 bg-red-50 border border-red-100 rounded-xl p-3">
+                  <AlertTriangle size={13} className="text-red-500 flex-shrink-0 mt-0.5" />
+                  <p className="text-xs text-red-600">{authError}</p>
+                </div>
+              )}
+              {authSuccess && (
+                <div className="flex items-start gap-2 bg-emerald-50 border border-emerald-100 rounded-xl p-3">
+                  <CheckCircle2 size={13} className="text-emerald-500 flex-shrink-0 mt-0.5" />
+                  <p className="text-xs text-emerald-600">{authSuccess}</p>
+                </div>
+              )}
+              {!SUPABASE_READY && (
+                <div className="flex items-start gap-2 bg-amber-50 border border-amber-100 rounded-xl p-3">
+                  <Info size={13} className="text-amber-500 flex-shrink-0 mt-0.5" />
+                  <div className="text-xs text-amber-700">
+                    <p className="font-bold">Supabase not configured</p>
+                    <p>Add <code className="bg-amber-100 px-1 rounded">VITE_SUPABASE_URL</code> and <code className="bg-amber-100 px-1 rounded">VITE_SUPABASE_ANON_KEY</code> to <code className="bg-amber-100 px-1 rounded">.env</code></p>
+                  </div>
+                </div>
+              )}
+              <button type="submit" disabled={authLoading || !SUPABASE_READY} className="btn-primary w-full py-3 flex items-center justify-center gap-2 disabled:opacity-60">
+                {authLoading ? <Loader2 size={14} className="anim-spin" /> : (authTab === 'signin' ? <LogIn size={14} /> : <User size={14} />)}
+                {authLoading ? 'Please wait...' : (authTab === 'signin' ? 'Sign In' : 'Create Account')}
+              </button>
+            </form>
+            <div className="px-8 pb-6 text-center">
+              <p className="text-[10px] text-slate-400"><Lock size={9} className="inline mr-1" />Secured with Row-Level Security. Only you can access your projects.</p>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
